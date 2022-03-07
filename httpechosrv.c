@@ -15,6 +15,9 @@
 #include <errno.h>
 #include <sys/select.h>
 #include <signal.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+
 #define MAXLINE 8192 /* max text line length */
 #define MAXBUF 8192  /* max I/O buffer size */
 #define LISTENQ 1024 /* second argument to listen() */
@@ -35,92 +38,85 @@ typedef struct cnt_status_s {
     char Status[MINBUF];
 } cnt_status_t;
 
-typedef struct cmd_flag_s {
-    int method;
-    bool connection_status;
-    bool connection_force_close;
-}cmd_flag_t;
-
 
 enum method{error = -1, get = 0,post,head};
-bool caught_alrm = false;
- 
+bool child_caught_alrm = false;
+bool parent_caught_alrm = false;
+
 int open_listenfd(int port);
-void echo(int connfd);
-void *thread(void *vargp);
+void handle_request(int connfd);
+void handle_connection(int connfd);
 bool is_timeout(int fd, fd_set accept_fd);
 static void signal_init();
-static void signal_handler(int signal);
 static void exiting(int fd);
+void get_file_transfer(char *URL, char *Version, int connfd);
+void error_handling(char *Version, int connfd);
+pid_t ppid;
 
-int main(int argc, char **argv)
-{
-    int listenfd, *connfdp, port, clientlen = sizeof(struct sockaddr_in);
+int main(int argc, char **argv){
+    int listenfd, connfd, port, clientlen = sizeof(struct sockaddr_in);
     struct sockaddr_in clientaddr;
-    pthread_t tid;
-    if (argc != 2)
-    {
+    pid_t pid;
+    if (argc != 2){
         fprintf(stderr, "usage: %s <port>\n", argv[0]);
         exit(0);
     }
     port = atoi(argv[1]);
     signal_init();
-    alarm(10);
+    ppid = getpid();
     listenfd = open_listenfd(port);
-    while (1)
-    {  
-        connfdp = malloc(sizeof(int));
-        printf("new connection???\n");
-        *connfdp = accept(listenfd, (struct sockaddr *)&clientaddr, (socklen_t * )&clientlen);
-        if(errno==EINTR){
-            printf("HEHE %d\n", errno);
-            free(connfdp);
-            continue;
+    while (!parent_caught_alrm){
+        connfd = accept(listenfd, (struct sockaddr *)&clientaddr, (socklen_t * )&clientlen);
+        if((connfd!=-1)){
+            if((pid=fork())==0){
+                handle_connection(connfd);
+            }else if(pid==-1){
+                exiting(connfd);
+            }
         }
-        
-        printf("new connection\n");
-        CHECK(pthread_create(&tid, NULL, thread, connfdp));
     }
+    signal(SIGQUIT,SIG_IGN);
+    kill(0,SIGQUIT);
+    if(pid!=0)
+        printf("Connection:Close\n");
 }
 
 static void exiting(int fd){
-    if(fd==-1){
-        printf("bad fd\n");
+    if(fd==-1)
         return;
-    }
     CHECK(shutdown(fd, SHUT_RDWR));
     close(fd);
 }
 
 
-static void signal_handler(int signal){
+void signal_handler(int signal, siginfo_t *info, void *context){
     int errno_cp = errno;
     if(signal == SIGALRM){
-        caught_alrm = true;
+        if((info->si_pid)==ppid){
+            parent_caught_alrm = true;
+        }else{
+            kill(ppid, SIGALRM);
+            child_caught_alrm = true;
+        }
     }
     errno = errno_cp;
 }
+
 static void signal_init(){
     struct sigaction time_action;
     memset(&time_action, 0, sizeof(struct sigaction));
-    time_action.sa_handler = signal_handler;
+    time_action.sa_sigaction = (void*) signal_handler;
+    sigemptyset(&time_action.sa_mask);
+    time_action.sa_flags = SA_RESTART|SA_SIGINFO;
     if(sigaction(SIGALRM, &time_action, NULL)!=0){
         printf("Error %d (%s) registering for SIGALRM\n", errno, strerror(errno));
     }
 }
 
-/* thread routine */
-void *thread(void *vargp)
-{
-    int connfd = *((int *)vargp);
-    pthread_detach(pthread_self());
-    free(vargp);
-    printf("new thread\n");
-    alarm(10);
-    echo(connfd);
+void handle_connection(int connfd){
+    handle_request(connfd);
     exiting(connfd);
-    printf("Connection: Close\n");
-    return NULL;
+    exit(0);
 }
 
 void cmd_to_idx(char *method, int *cmd_idx){
@@ -135,40 +131,26 @@ void cmd_to_idx(char *method, int *cmd_idx){
     }
 }
 
-void connection_check(char *in, bool *status, bool *force_close){
+void connection_check(char *in){
     cnt_status_t cnt;
     char in_cp[MIDBUF];
-    *status = false;
-    *force_close = false;
+    
     strcpy(in_cp, in);
     sscanf(in_cp, "%s %s", cnt.Connection,cnt.Status);
     if((strcmp(cnt.Connection, "Connection:")==0) && (strcmp(cnt.Status, "Keep-alive")==0)){
-        *status = true;
-        *force_close = false;
+        alarm(10);
     }else if((strcmp(cnt.Connection, "Connection:")==0) && (strcmp(cnt.Status, "Close")==0)){
-        *status = true;
-        *force_close = true;
+        kill(ppid, SIGALRM);
     }
 }
 
 
-void error_handling(char *Version, int connfd){
-    char header[MAXBUF];
-    int content_len = 0;
-    char content[] = "<html><head></head><body><h1>500 Internal Server Error<h1></body></html>";
-    uint32_t header_len=0;
-    content_len = strlen(content);
-    header_len = snprintf(header, MAXBUF, "HTTP/1.1 500 Internal Server Error\r\n");
-    header_len+= snprintf(header+header_len, MAXBUF-header_len, "Content-Type: text/html\r\n");
-    header_len+= snprintf(header+header_len, MAXBUF-header_len, "Content-Length: %u\r\n\r\n", content_len);
-    CHECK(send(connfd, header, strlen(header), 0));
-    CHECK(send(connfd, content, content_len,0));
-}
+
 
 //printf("Method: %s URL: %s Version: %s\n", rq.Method, rq.URL, rq.Version);
 //printf("status=%d, force_close=%d, method=%d\n", flag.connection_status, flag.connection_force_close, flag.method);
 //sscanf(line, "%s %s %s", (*rq).Method, (*rq).URL, (*rq).Version); 
-void parse_client_request(char *in, clnt_rq_t *rq, cmd_flag_t *flag){
+void parse_client_request(char *in, clnt_rq_t *rq){
     char in_cp[MAXBUF];
     char *line= NULL;
     char line_cp[MAXBUF];
@@ -188,14 +170,8 @@ void parse_client_request(char *in, clnt_rq_t *rq, cmd_flag_t *flag){
     strcpy((*rq).URL,     token[1]);
     strcpy((*rq).Version, token[2]);
 
-    cmd_to_idx((*rq).Method, &((*flag).method));
-    if(((*flag).method)==error){
-        printf("#%d invalid method\n", __LINE__);
-        return;
-    }
-
     while (line!= NULL){
-        connection_check(line, &((*flag).connection_status), &((*flag).connection_force_close));
+        connection_check(line);
         line = strtok(NULL, "\r\n");
     }
     printf("Method: [%s] URL: [%s] Version: [%s]\n", rq->Method, rq->URL, rq->Version);
@@ -259,38 +235,31 @@ void get_file_transfer(char *URL, char *Version, int connfd){
 
 }
 
-//https://stackoverflow.com/questions/28896388/implementing-execution-timeout-with-c-c
-// bool is_timeout(int fd, fd_set accept_fd){
-//     int ret = -1;
-//     struct timeval timeout = {10,0};
 
-//     FD_ZERO(&accept_fd);
-//     FD_SET(fd, &accept_fd);
-//     CHECK(ret = select(8, &accept_fd, NULL,NULL,&timeout));
-//     if(ret==0) 
-//         return true;
-//     return false;
-// }
-
-void variable_init(cmd_flag_t *cmd_flag, clnt_rq_t *client_request){
-    (*cmd_flag).connection_status = false;
-    (*cmd_flag).connection_force_close = false;
-    (*cmd_flag).method = error;
-    memset(client_request, 0, sizeof(*client_request));
-}
-void echo(int connfd){
-    cmd_flag_t cmd_flag;
+void handle_request(int connfd){
     char buf[MAXLINE];
     clnt_rq_t client_request;
-    while(!caught_alrm){
-        variable_init(&cmd_flag, &client_request);
+    memset(&client_request, 0, sizeof(client_request));
+    while((!child_caught_alrm)&&(connfd!=-1)){
         CHECK(read(connfd, buf, MAXLINE));
-        parse_client_request(buf, &client_request, &cmd_flag);
+        parse_client_request(buf, &client_request);
         get_file_transfer(client_request.URL,client_request.Version,connfd);
     }
-    pthread_exit(0); 
 }
 
+
+void error_handling(char *Version, int connfd){
+    char header[MAXBUF];
+    int content_len = 0;
+    char content[] = "<html><head></head><body><h1>500 Internal Server Error<h1></body></html>";
+    uint32_t header_len=0;
+    content_len = strlen(content);
+    header_len = snprintf(header, MAXBUF, "HTTP/1.1 500 Internal Server Error\r\n");
+    header_len+= snprintf(header+header_len, MAXBUF-header_len, "Content-Type: text/html\r\n");
+    header_len+= snprintf(header+header_len, MAXBUF-header_len, "Content-Length: %u\r\n\r\n", content_len);
+    CHECK(send(connfd, header, strlen(header), 0));
+    CHECK(send(connfd, content, content_len,0));
+}
 
 /*
  * open_listenfd - open and return a listening socket on port
@@ -300,11 +269,11 @@ int open_listenfd(int port)
 {
     int listenfd, optval = 1;
     struct sockaddr_in serveraddr;
-
+    int flags;
     /* Create a socket descriptor */
-    if ((listenfd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
-        return -1;
-
+    listenfd = CHECK(socket(AF_INET, SOCK_STREAM, 0));
+    flags = CHECK(fcntl(listenfd,F_GETFL));
+    CHECK(fcntl(listenfd,F_SETFL, flags | O_NONBLOCK));
     /* Eliminates "Address already in use" error from bind. */
     CHECK(setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR,
                    (const void *)&optval, sizeof(int)));
