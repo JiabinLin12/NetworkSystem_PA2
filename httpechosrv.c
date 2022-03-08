@@ -17,6 +17,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <ctype.h>
 
 #define MAXLINE 8192 /* max text line length */
 #define MAXBUF 8192  /* max I/O buffer size */
@@ -24,6 +25,7 @@
 #define MINBUF 20
 #define MIDBUF 150
 #define ROOT 47
+#define TIMEOUT 20
 
 #define CHECK(X) ({int __val = (X); (__val == (-1) ? ({fprintf(stderr, "ERROR ("__FILE__":%d) -- %s\n", __LINE__, strerror(errno)); exit(-1); -1;}) : __val);})
 
@@ -33,25 +35,27 @@ typedef struct clnt_rq_s {
     char Version[MIDBUF];
 } clnt_rq_t;
 
-typedef struct cnt_status_s {
-    char Connection[MINBUF];
-    char Status[MINBUF];
-} cnt_status_t;
 
 
 enum method{error = -1, get = 0,post,head};
 bool child_caught_alrm = false;
 bool parent_caught_alrm = false;
 
-int open_listenfd(int port);
-void handle_request(int connfd);
-void handle_connection(int connfd);
-bool is_timeout(int fd, fd_set accept_fd);
+static int open_listenfd(int port);
 static void signal_init();
 static void exiting(int fd);
-void get_file_transfer(char *URL, char *Version, int connfd);
-void error_handling(char *Version, int connfd);
+//static void null_checker(void *in, char *msg);
+static void handle_request(int connfd);
+static bool keepalive(char *status);
+static bool supported_method(char *method);
+static void get_file_transfer(clnt_rq_t request, int connfd);
+static void error_handling(int connfd);
+static void fork_handle_connection(int connfd, pid_t *pid);
+static void parse_client_request(char *in, clnt_rq_t *rq);
+static void connection_check(char *in);
 pid_t ppid;
+
+
 
 int main(int argc, char **argv){
     int listenfd, connfd, port, clientlen = sizeof(struct sockaddr_in);
@@ -67,25 +71,77 @@ int main(int argc, char **argv){
     listenfd = open_listenfd(port);
     while (!parent_caught_alrm){
         connfd = accept(listenfd, (struct sockaddr *)&clientaddr, (socklen_t * )&clientlen);
-        if((connfd!=-1)){
-            if((pid=fork())==0){
-                handle_connection(connfd);
-            }else if(pid==-1){
-                exiting(connfd);
-            }
-        }
+        fork_handle_connection(connfd, &pid);
     }
-    signal(SIGQUIT,SIG_IGN);
-    kill(0,SIGQUIT);
-    if(pid!=0)
+    if(pid!=0){
+        // signal(SIGQUIT,SIG_IGN);
+        // kill(0,SIGQUIT);
+        kill(0,SIGALRM);
+        wait(NULL);
         printf("Connection:Close\n");
+    }
 }
 
-static void exiting(int fd){
-    if(fd==-1)
+
+static void fork_handle_connection(int connfd, pid_t *pid){
+    if((connfd==-1))
         return;
+    if(((*pid)=fork())==0){
+        handle_request(connfd);
+    }else if((*pid)==-1){
+        error_handling(connfd);
+    }
+}
+
+
+static void exiting(int fd){
     CHECK(shutdown(fd, SHUT_RDWR));
     close(fd);
+    exit(0);
+}
+
+static void handle_request(int connfd){
+    char buf[MAXLINE];
+    clnt_rq_t client_request;
+    memset(&client_request, 0, sizeof(client_request));
+    while((!child_caught_alrm)&&(connfd!=-1)){
+        CHECK(read(connfd, buf, MAXLINE));
+        parse_client_request(buf, &client_request);
+        connection_check(buf);
+        get_file_transfer(client_request,connfd);
+    }
+    exiting(connfd);
+}
+
+
+
+
+static void connection_keyword(char *connection, char *status, bool *force_kill){
+    if((strcmp(connection, "Connection:")==0)){
+        if(keepalive(status)){
+            alarm(TIMEOUT);
+        }else if(strcmp(status, "close")==0){
+            *force_kill = true;
+        }
+    }
+}
+
+static void connection_check(char *in){
+    bool force_kill=false;
+    char connection[MAXBUF];
+    char status[MAXBUF];
+    char in_cp[MAXBUF];
+    char *p= NULL;
+    strcpy(in_cp, in);
+    p = strtok(in_cp, "\r\n");
+    while (p!= NULL){
+        sscanf(p, "%s %s", connection,status);
+        connection_keyword(connection,status, &force_kill);
+        p = strtok(NULL, "\r\n");
+    }
+    if(force_kill){
+        kill(ppid, SIGALRM);
+    }
 }
 
 
@@ -113,51 +169,20 @@ static void signal_init(){
     }
 }
 
-void handle_connection(int connfd){
-    handle_request(connfd);
-    exiting(connfd);
-    exit(0);
-}
-
-void cmd_to_idx(char *method, int *cmd_idx){
-    if(strcmp(method, "GET")==0){
-        *cmd_idx = get;
-    }else if(strcmp(method, "POST")==0){
-        *cmd_idx = post;
-    }else if(strcmp(method, "HEAD")==0){
-        *cmd_idx = head;
-    }else{
-        *cmd_idx = error;
-    }
-}
-
-void connection_check(char *in){
-    cnt_status_t cnt;
-    char in_cp[MIDBUF];
-    
-    strcpy(in_cp, in);
-    sscanf(in_cp, "%s %s", cnt.Connection,cnt.Status);
-    if((strcmp(cnt.Connection, "Connection:")==0) && (strcmp(cnt.Status, "Keep-alive")==0)){
-        alarm(10);
-    }else if((strcmp(cnt.Connection, "Connection:")==0) && (strcmp(cnt.Status, "Close")==0)){
-        kill(ppid, SIGALRM);
-    }
-}
-
-
-
 
 //printf("Method: %s URL: %s Version: %s\n", rq.Method, rq.URL, rq.Version);
 //printf("status=%d, force_close=%d, method=%d\n", flag.connection_status, flag.connection_force_close, flag.method);
 //sscanf(line, "%s %s %s", (*rq).Method, (*rq).URL, (*rq).Version); 
-void parse_client_request(char *in, clnt_rq_t *rq){
+//printf("__%d__\n%s\n",__LINE__,in_cp);
+//printf("check %d\n", j++);
+//int j=0;
+static void parse_client_request(char *in, clnt_rq_t *rq){
     char in_cp[MAXBUF];
     char *line= NULL;
     char line_cp[MAXBUF];
     char *token[3], *p;
-     int i =0;
+    int i =0;
     strcpy(in_cp, in);
-
     line = strtok(in_cp, "\r\n");
     strcpy(line_cp, line);
 
@@ -169,22 +194,12 @@ void parse_client_request(char *in, clnt_rq_t *rq){
     strcpy((*rq).Method,  token[0]);
     strcpy((*rq).URL,     token[1]);
     strcpy((*rq).Version, token[2]);
-
-    while (line!= NULL){
-        connection_check(line);
-        line = strtok(NULL, "\r\n");
-    }
     printf("Method: [%s] URL: [%s] Version: [%s]\n", rq->Method, rq->URL, rq->Version);
 }
 
-void null_checker(void *in, char *msg){
-    if(in==NULL){
-        printf("%s\n", msg);
-        exit(-1);
-    }
-}
 
-void get_file_transfer(char *URL, char *Version, int connfd){
+
+static void get_file_transfer(clnt_rq_t request, int connfd){
     FILE *fd; 
     char *ftype;
     uint32_t header_len=0;
@@ -193,62 +208,63 @@ void get_file_transfer(char *URL, char *Version, int connfd){
     char dir[MAXBUF]="www";
     char fbuffer[MAXBUF];
     size_t byte_read = 0;
-    if(!URL||!Version)
-        return;
+    const char post_data[] = "\n<html><body><pre><h1 style=\"color:blue;\">POSTDATA </h1></pre>";
+    if(!request.URL ||!request.Version || !(supported_method(request.Method))){
+        error_handling(connfd);
+        alarm(TIMEOUT);
+        return;      
+    }
     memset(fbuffer, 0, sizeof(fbuffer));
-    if(*(URL) == ROOT){
-        if(URL+1!=NULL){
-            strcat(dir, URL);
+    if(*(request.URL) == ROOT){
+        if(request.URL+1!=NULL){
+            strcat(dir, request.URL);
         }
 
         fd = fopen(dir, "r");
-        null_checker(fd,"No path found");  
+        if(fd==NULL){
+            error_handling(connfd);
+            alarm(TIMEOUT);
+            return;        
+        }
 
-        ftype = strrchr(URL, '.');
+        ftype = strrchr(request.URL, '.');
         if(!ftype){
             fd = fopen("www/index.html", "r");
-            null_checker(fd,"No path found");  
             ftype = "html";
         }else{
             ftype++;
         }
-
+       
         fseek(fd, 0, SEEK_END);
         fsize = ftell(fd);
         rewind(fd);
 
-        header_len = snprintf(header, MAXBUF, "%s ", Version);
+        header_len = snprintf(header, MAXBUF, "%s ", request.Version);
         header_len+= snprintf(header+header_len, MAXBUF-header_len, "200 OK\r\n");
         header_len+= snprintf(header+header_len, MAXBUF-header_len, "Content-Type: %s\r\n", ftype);
         header_len+= snprintf(header+header_len, MAXBUF-header_len, "Content-Length: %d\r\n", fsize);
         header_len+= snprintf(header+header_len, MAXBUF-header_len, "Connection:Keep-alive\r\n\r\n");
-        if(send(connfd, header, header_len, 0)<0){
-            error_handling(Version, connfd);
+        CHECK(send(connfd, header, header_len, 0)<0);
+        if(!strcmp(ftype, "html")){
+            byte_read = strlen(post_data);
+            send(connfd, post_data, byte_read, 0);
         }
+        
+        //strcat(fbuffer, post_data);
         while((byte_read = fread(fbuffer, 1, MAXBUF, fd))> 0 || !feof(fd)) {
-            if(send(connfd, fbuffer, byte_read, 0)<0){
-                error_handling(Version, connfd);
-            }
+            CHECK(send(connfd, fbuffer, byte_read, 0)<0);
         }
-        alarm(10);
+    }else{
+        error_handling(connfd);        
     }
+    alarm(TIMEOUT);
 
 }
 
 
-void handle_request(int connfd){
-    char buf[MAXLINE];
-    clnt_rq_t client_request;
-    memset(&client_request, 0, sizeof(client_request));
-    while((!child_caught_alrm)&&(connfd!=-1)){
-        CHECK(read(connfd, buf, MAXLINE));
-        parse_client_request(buf, &client_request);
-        get_file_transfer(client_request.URL,client_request.Version,connfd);
-    }
-}
 
 
-void error_handling(char *Version, int connfd){
+static void error_handling(int connfd){
     char header[MAXBUF];
     int content_len = 0;
     char content[] = "<html><head></head><body><h1>500 Internal Server Error<h1></body></html>";
@@ -260,6 +276,23 @@ void error_handling(char *Version, int connfd){
     CHECK(send(connfd, header, strlen(header), 0));
     CHECK(send(connfd, content, content_len,0));
 }
+
+static bool keepalive(char *status){
+    return (strcmp(status, "keep-alive")==0) || 
+           (strcmp(status, "Keep-alive")==0) || 
+           (strcmp(status, "Keep-Alive")==0) || 
+           (strcmp(status, "Keepalive")==0)  ||
+           (strcmp(status, "KeepAlive")==0)  ||         
+           (strcmp(status, "keepalive")==0);       
+
+}
+
+static bool supported_method(char *method){
+    return (strcmp(method, "GET")==0) || 
+           (strcmp(method, "POST")==0);
+}
+
+
 
 /*
  * open_listenfd - open and return a listening socket on port
