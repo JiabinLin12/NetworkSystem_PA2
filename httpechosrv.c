@@ -25,7 +25,7 @@
 #define MINBUF 20
 #define MIDBUF 150
 #define ROOT 47
-#define TIMEOUT 20
+#define TIMEOUT 10
 
 #define CHECK(X) ({int __val = (X); (__val == (-1) ? ({fprintf(stderr, "ERROR ("__FILE__":%d) -- %s\n", __LINE__, strerror(errno)); exit(-1); -1;}) : __val);})
 
@@ -36,25 +36,25 @@ typedef struct clnt_rq_s {
 } clnt_rq_t;
 
 
-
+enum connectivity{live, dead};
 enum method{error = -1, get = 0,post,head};
-bool child_caught_alrm = false;
-bool parent_caught_alrm = false;
 
+bool caught_alrm = false;
 static int open_listenfd(int port);
 static void signal_init();
-static void exiting(int fd);
-//static void null_checker(void *in, char *msg);
-static void handle_request(int connfd);
-static bool keepalive(char *status);
+static void open_pipe(int *pipe_fd);
+static void handle_request(int connfd,int *pipefd);
+static bool iskeepalive(char *status);
 static bool supported_method(char *method);
 static void get_file_transfer(clnt_rq_t request, int connfd);
 static void error_handling(int connfd);
-static void fork_handle_connection(int connfd, pid_t *pid);
+static void fork_handle_connection(int connfd, int *pipefd,pid_t *pid);
 static void parse_client_request(char *in, clnt_rq_t *rq);
-static void connection_check(char *in);
+static void connection_check(char *in,int *pipefd);
+static void child_state(int *pipefd);
+static void child_exiting(int fd);
+static void parent_exiting(pid_t pid, int pipe_fdw);
 pid_t ppid;
-
 
 
 int main(int argc, char **argv){
@@ -65,99 +65,143 @@ int main(int argc, char **argv){
         fprintf(stderr, "usage: %s <port>\n", argv[0]);
         exit(0);
     }
+    int pipe_fd[2];
     port = atoi(argv[1]);
     signal_init();
+    open_pipe(pipe_fd);
     ppid = getpid();
     listenfd = open_listenfd(port);
-    while (!parent_caught_alrm){
+    while (!caught_alrm){
+        child_state(pipe_fd);
         connfd = accept(listenfd, (struct sockaddr *)&clientaddr, (socklen_t * )&clientlen);
-        fork_handle_connection(connfd, &pid);
+        fork_handle_connection(connfd, pipe_fd, &pid);
     }
+    parent_exiting(pid, pipe_fd[1]);
+}
+
+/*
+ * parent_exiting - exiting from parent
+ */
+static void parent_exiting(pid_t pid, int pipe_fdw){
     if(pid!=0){
-        // signal(SIGQUIT,SIG_IGN);
-        // kill(0,SIGQUIT);
-        kill(0,SIGALRM);
         wait(NULL);
+        if(pipe_fdw!=-1)
+            close(pipe_fdw);
         printf("Connection:Close\n");
     }
 }
-
-
-static void fork_handle_connection(int connfd, pid_t *pid){
+/*
+ * fork_handle_connection - fork connection when the 
+ * tcp connection estabilished
+ */
+static void fork_handle_connection(int connfd, int *pipefd, pid_t *pid){
     if((connfd==-1))
         return;
     if(((*pid)=fork())==0){
-        handle_request(connfd);
+        handle_request(connfd,pipefd);
     }else if((*pid)==-1){
         error_handling(connfd);
     }
 }
 
-
-static void exiting(int fd){
+/*
+ * child_exiting - exiting from child 
+ */
+static void child_exiting(int fd){
     CHECK(shutdown(fd, SHUT_RDWR));
     close(fd);
     exit(0);
 }
 
-static void handle_request(int connfd){
+/*
+ * handle_request - handling request like 
+ * request parse, request connection state
+ * transfer file and clean up
+ */
+static void handle_request(int connfd,int *pipefd){
     char buf[MAXLINE];
     clnt_rq_t client_request;
     memset(&client_request, 0, sizeof(client_request));
-    while((!child_caught_alrm)&&(connfd!=-1)){
-        CHECK(read(connfd, buf, MAXLINE));
-        parse_client_request(buf, &client_request);
-        connection_check(buf);
-        get_file_transfer(client_request,connfd);
-    }
-    exiting(connfd);
+    CHECK(read(connfd, buf, MAXLINE));
+    parse_client_request(buf, &client_request);
+    connection_check(buf,pipefd);
+    get_file_transfer(client_request,connfd);
+    child_exiting(connfd);
 }
 
 
-
-
-static void connection_keyword(char *connection, char *status, bool *force_kill){
+/*
+ * connection_keyword - check client connection 
+ * request and set connection state
+ */
+static void connection_keyword(char *connection, char *status, enum connectivity *state){
     if((strcmp(connection, "Connection:")==0)){
-        if(keepalive(status)){
-            alarm(TIMEOUT);
-        }else if(strcmp(status, "close")==0){
-            *force_kill = true;
+        if(!iskeepalive(status) || !(strcmp(status, "close"))){
+            *state = dead;
         }
     }
 }
-
-static void connection_check(char *in){
-    bool force_kill=false;
+/*
+ * connection_check - break down http request line
+ * and check the connection keyword
+ * write to parent about the connection state 
+ */
+static void connection_check(char *in, int *pipefd){
     char connection[MAXBUF];
     char status[MAXBUF];
     char in_cp[MAXBUF];
     char *p= NULL;
+    enum connectivity state = live;
     strcpy(in_cp, in);
+    //check everyline with dimiliter "\r\n"
     p = strtok(in_cp, "\r\n");
     while (p!= NULL){
         sscanf(p, "%s %s", connection,status);
-        connection_keyword(connection,status, &force_kill);
+        connection_keyword(connection,status, &state);
         p = strtok(NULL, "\r\n");
     }
-    if(force_kill){
-        kill(ppid, SIGALRM);
+    //close read pipe and write to parents
+    close(pipefd[0]);
+    write(pipefd[1],&state,sizeof(int));
+    close(pipefd[1]);
+}
+
+/*
+ * child_state - calling from parent
+ * to get child connectivity report
+ */
+static void child_state(int *pipefd){
+    int pid;
+    int state;
+    if((pid = getpid())==0)
+        return;
+    //read from parents
+    read(pipefd[0], &state, sizeof(int));
+    //reset timer
+    if(state == live){
+        alarm(TIMEOUT);
+    //kill the parent loop
+    }else if (state == dead){
+        kill(pid, SIGALRM);
     }
 }
 
-
+/*
+ * signal_handler - handle only SIGALRM
+ * to end the parent process
+ */
 void signal_handler(int signal, siginfo_t *info, void *context){
     int errno_cp = errno;
     if(signal == SIGALRM){
-        if((info->si_pid)==ppid){
-            parent_caught_alrm = true;
-        }else{
-            kill(ppid, SIGALRM);
-            child_caught_alrm = true;
-        }
+        caught_alrm = true;
     }
     errno = errno_cp;
 }
 
+
+/*
+ * signal_init - init signal
+ */
 static void signal_init(){
     struct sigaction time_action;
     memset(&time_action, 0, sizeof(struct sigaction));
@@ -170,12 +214,9 @@ static void signal_init(){
 }
 
 
-//printf("Method: %s URL: %s Version: %s\n", rq.Method, rq.URL, rq.Version);
-//printf("status=%d, force_close=%d, method=%d\n", flag.connection_status, flag.connection_force_close, flag.method);
-//sscanf(line, "%s %s %s", (*rq).Method, (*rq).URL, (*rq).Version); 
-//printf("__%d__\n%s\n",__LINE__,in_cp);
-//printf("check %d\n", j++);
-//int j=0;
+/*
+ * parse_client_request - get client connection request
+ */
 static void parse_client_request(char *in, clnt_rq_t *rq){
     char in_cp[MAXBUF];
     char *line= NULL;
@@ -198,7 +239,9 @@ static void parse_client_request(char *in, clnt_rq_t *rq){
 }
 
 
-
+/*
+ * get_file_transfer - transfer file base on request
+ */
 static void get_file_transfer(clnt_rq_t request, int connfd){
     FILE *fd; 
     char *ftype;
@@ -216,11 +259,13 @@ static void get_file_transfer(clnt_rq_t request, int connfd){
     }
     memset(fbuffer, 0, sizeof(fbuffer));
     if(*(request.URL) == ROOT){
+        /*check if exist a path other than ROOT*/
         if(request.URL+1!=NULL){
             strcat(dir, request.URL);
         }
 
         fd = fopen(dir, "r");
+        //handle error of wrong directory 
         if(fd==NULL){
             error_handling(connfd);
             alarm(TIMEOUT);
@@ -234,36 +279,38 @@ static void get_file_transfer(clnt_rq_t request, int connfd){
         }else{
             ftype++;
         }
-       
+        //get file size
         fseek(fd, 0, SEEK_END);
         fsize = ftell(fd);
         rewind(fd);
 
+        //header construction
         header_len = snprintf(header, MAXBUF, "%s ", request.Version);
         header_len+= snprintf(header+header_len, MAXBUF-header_len, "200 OK\r\n");
         header_len+= snprintf(header+header_len, MAXBUF-header_len, "Content-Type: %s\r\n", ftype);
         header_len+= snprintf(header+header_len, MAXBUF-header_len, "Content-Length: %d\r\n", fsize);
         header_len+= snprintf(header+header_len, MAXBUF-header_len, "Connection:Keep-alive\r\n\r\n");
         CHECK(send(connfd, header, header_len, 0)<0);
-        if(!strcmp(ftype, "html")){
+        
+        if(!strcmp(ftype, "html") && !strcmp(request.Method, "POST")){
             byte_read = strlen(post_data);
             send(connfd, post_data, byte_read, 0);
         }
-        
-        //strcat(fbuffer, post_data);
+
         while((byte_read = fread(fbuffer, 1, MAXBUF, fd))> 0 || !feof(fd)) {
             CHECK(send(connfd, fbuffer, byte_read, 0)<0);
         }
+       
     }else{
         error_handling(connfd);        
     }
-    alarm(TIMEOUT);
-
 }
 
 
 
-
+/*
+ * error_handling - transfer 500 on error
+ */
 static void error_handling(int connfd){
     char header[MAXBUF];
     int content_len = 0;
@@ -273,11 +320,17 @@ static void error_handling(int connfd){
     header_len = snprintf(header, MAXBUF, "HTTP/1.1 500 Internal Server Error\r\n");
     header_len+= snprintf(header+header_len, MAXBUF-header_len, "Content-Type: text/html\r\n");
     header_len+= snprintf(header+header_len, MAXBUF-header_len, "Content-Length: %u\r\n\r\n", content_len);
+    //send header packet
     CHECK(send(connfd, header, strlen(header), 0));
+    //send 500 error
     CHECK(send(connfd, content, content_len,0));
 }
 
-static bool keepalive(char *status){
+
+/*
+ *iskeepalive - is it keepalive keyword
+ */
+static bool iskeepalive(char *status){
     return (strcmp(status, "keep-alive")==0) || 
            (strcmp(status, "Keep-alive")==0) || 
            (strcmp(status, "Keep-Alive")==0) || 
@@ -286,7 +339,9 @@ static bool keepalive(char *status){
            (strcmp(status, "keepalive")==0);       
 
 }
-
+/*
+ *supported_method - is the method supported
+ */
 static bool supported_method(char *method){
     return (strcmp(method, "GET")==0) || 
            (strcmp(method, "POST")==0);
@@ -323,3 +378,14 @@ int open_listenfd(int port)
     CHECK(listen(listenfd, LISTENQ));
     return listenfd;
 } /* end open_listenfd */
+
+/**
+ * @brief open a non blocking read pipe
+ * @param pipe_fd 
+ */
+void open_pipe(int *pipe_fd){
+    int flags;
+    CHECK(pipe(pipe_fd));
+    flags = CHECK(fcntl(*pipe_fd,F_GETFL));
+    CHECK(fcntl(*pipe_fd,F_SETFL, flags | O_NONBLOCK));
+}
