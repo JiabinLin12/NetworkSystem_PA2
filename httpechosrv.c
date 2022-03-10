@@ -26,7 +26,7 @@
 #define MIDBUF 150
 #define ROOT 47
 #define TIMEOUT 10
-
+#define NEWLINE 10
 #define CHECK(X) ({int __val = (X); (__val == (-1) ? ({fprintf(stderr, "ERROR ("__FILE__":%d) -- %s\n", __LINE__, strerror(errno)); exit(-1); -1;}) : __val);})
 
 typedef struct clnt_rq_s {
@@ -46,14 +46,15 @@ static void open_pipe(int *pipe_fd);
 static void handle_request(int connfd,int *pipefd);
 static bool iskeepalive(char *status);
 static bool supported_method(char *method);
-static void get_file_transfer(clnt_rq_t request, int connfd);
+static void get_file_transfer(clnt_rq_t request, int connfd, char **post_data);
 static void error_handling(int connfd);
 static void fork_handle_connection(int connfd, int *pipefd,pid_t *pid);
 static void parse_client_request(char *in, clnt_rq_t *rq);
-static void connection_check(char *in,int *pipefd);
+static void header_lookup(char *in, int *pipefd, char *Method, char **post_data);
 static void child_state(int *pipefd);
 static void child_exiting(int fd);
 static void parent_exiting(pid_t pid, int pipe_fdw);
+static void get_post_data(char *Method, char *line, char **post_data);
 pid_t ppid;
 
 
@@ -121,14 +122,26 @@ static void child_exiting(int fd){
 static void handle_request(int connfd,int *pipefd){
     char buf[MAXLINE];
     clnt_rq_t client_request;
+    char *post_data = NULL;
     memset(&client_request, 0, sizeof(client_request));
     CHECK(read(connfd, buf, MAXLINE));
     parse_client_request(buf, &client_request);
-    connection_check(buf,pipefd);
-    get_file_transfer(client_request,connfd);
+    header_lookup(buf, pipefd, client_request.Method, &post_data);
+    get_file_transfer(client_request,connfd,&post_data);
     child_exiting(connfd);
 }
 
+
+static void get_post_data(char *Method, char *line,char **post_data){
+    char post_data_tmp[1024];
+    if(!line) return;
+    if(strcmp(Method, "POST")==0){
+        if(strcmp(line, "\r\n")&&(line+2!=NULL)){
+            strcpy(post_data_tmp, line);
+            *post_data = post_data_tmp;
+        }
+    }
+}
 
 /*
  * connection_keyword - check client connection 
@@ -136,6 +149,7 @@ static void handle_request(int connfd,int *pipefd){
  */
 static void connection_keyword(char *connection, char *status, enum connectivity *state){
     if((strcmp(connection, "Connection:")==0)){
+        *state = live;
         if(!iskeepalive(status) || !(strcmp(status, "close"))){
             *state = dead;
         }
@@ -146,19 +160,20 @@ static void connection_keyword(char *connection, char *status, enum connectivity
  * and check the connection keyword
  * write to parent about the connection state 
  */
-static void connection_check(char *in, int *pipefd){
+static void header_lookup(char *in, int *pipefd, char *Method, char **post_data){
     char connection[MAXBUF];
     char status[MAXBUF];
     char in_cp[MAXBUF];
     char *p= NULL;
-    enum connectivity state = live;
+    enum connectivity state = dead;
     strcpy(in_cp, in);
     //check everyline with dimiliter "\r\n"
     p = strtok(in_cp, "\r\n");
     while (p!= NULL){
+        get_post_data(Method, p,post_data);
         sscanf(p, "%s %s", connection,status);
         connection_keyword(connection,status, &state);
-        p = strtok(NULL, "\r\n");
+        p = strtok(NULL, "\r\n"); 
     }
     //close read pipe and write to parents
     close(pipefd[0]);
@@ -242,16 +257,15 @@ static void parse_client_request(char *in, clnt_rq_t *rq){
 /*
  * get_file_transfer - transfer file base on request
  */
-static void get_file_transfer(clnt_rq_t request, int connfd){
+static void get_file_transfer(clnt_rq_t request, int connfd, char **post_data){
     FILE *fd; 
     char *ftype;
-    uint32_t header_len=0;
+    uint32_t header_len=0, post_len;
     uint32_t fsize = 0;
-    char header[MAXBUF];
+    char header[MAXBUF], post_buf[200];
     char dir[MAXBUF]="www";
     char fbuffer[MAXBUF];
     size_t byte_read = 0;
-    const char post_data[] = "\n<html><body><pre><h1 style=\"color:blue;\">POSTDATA </h1></pre>";
     if(!request.URL ||!request.Version || !(supported_method(request.Method))){
         error_handling(connfd);
         alarm(TIMEOUT);
@@ -291,10 +305,10 @@ static void get_file_transfer(clnt_rq_t request, int connfd){
         header_len+= snprintf(header+header_len, MAXBUF-header_len, "Content-Length: %d\r\n", fsize);
         header_len+= snprintf(header+header_len, MAXBUF-header_len, "Connection:Keep-alive\r\n\r\n");
         CHECK(send(connfd, header, header_len, 0)<0);
-        
-        if(!strcmp(ftype, "html") && !strcmp(request.Method, "POST")){
-            byte_read = strlen(post_data);
-            send(connfd, post_data, byte_read, 0);
+        if(!strcmp(ftype, "html") && !strcmp(request.Method, "POST") && *post_data!=NULL ){
+            post_len = snprintf(post_buf, 200, "<html><body><pre><h1 style=\"color:blue;\">%s </h1></pre>", *post_data);
+            printf("%s\n", post_buf);
+            send(connfd, post_buf, post_len, 0);
         }
 
         while((byte_read = fread(fbuffer, 1, MAXBUF, fd))> 0 || !feof(fd)) {
